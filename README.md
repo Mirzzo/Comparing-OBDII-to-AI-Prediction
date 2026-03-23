@@ -37,6 +37,18 @@ To handle the strong class imbalance, the training pipeline now oversamples mino
 - `src/maintenance_prediction/cli.py`: command-line interface
 - `obdii_comparison/`: separate OBD-II-style comparison workbook generator
 
+## Dataset download
+
+This repository does not include the raw SCANIA Component X dataset.
+
+Download it before running the project:
+
+https://researchdata.se/en/catalogue/dataset/2024-34
+
+The dataset is not committed to Git because it is large and externally hosted.
+You need to download it manually and place the extracted files under `Dataset/`
+so the project can find `Dataset/data/*.csv` and `Dataset/documentation/*`.
+
 ## Setup
 
 Install Python 3.10+ and then install dependencies:
@@ -94,3 +106,4 @@ After `run`, the project writes:
 - The operational files are large, so the feature builder reads them in chunks instead of loading the full training CSV into memory.
 - The code assumes the operational readout files are ordered by `vehicle_id` and `time_step`, which matches the supplied dataset structure.
 - The raw dataset and generated artifacts are intentionally ignored in Git so the repository stays lightweight and the comparison tooling remains reproducible from local files.
+- The dataset must be downloaded manually before `python main.py prepare-features` or `python main.py run` will work.
