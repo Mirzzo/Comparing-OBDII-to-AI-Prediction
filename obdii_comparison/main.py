@@ -6,6 +6,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from obdii_comparison.reactive_details import (
+    CLASS_TO_REACTIVE_STATUS,
+    CLASS_TO_RECOMMENDATION,
+    CLASS_TO_RISK_BAND,
+    CLASS_TO_WINDOW,
+    ReactiveBaselineExplainer,
+)
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -23,6 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     test_features = pd.read_csv(feature_dir / "test_features.csv")
     metrics = json.loads((report_dir / "metrics.json").read_text(encoding="utf-8"))
     ai_prediction_tables = load_prediction_tables(report_dir)
+    class_distribution = build_class_distribution_sheet(
+        validation_features=validation_features,
+        test_features=test_features,
+    )
 
     selected_ai_model = args.ai_model or choose_default_ai_model(metrics)
     print(
@@ -32,38 +44,47 @@ def main(argv: list[str] | None = None) -> int:
 
     baseline_metrics = metrics["reactive_baseline"]
     baseline_prediction_tables = ai_prediction_tables["reactive_baseline"]
+    explainer = ReactiveBaselineExplainer.load(
+        project_root=project_root,
+        artifacts_dir=artifacts_dir,
+    )
+    validation_baseline_details = explainer.explain_predictions(
+        feature_frame=validation_features,
+        prediction_frame=baseline_prediction_tables["validation"],
+    )
+    test_baseline_details = explainer.explain_predictions(
+        feature_frame=test_features,
+        prediction_frame=baseline_prediction_tables["test"],
+    )
     save_reactive_baseline_outputs(
         output_dir=output_dir,
         baseline_metrics=baseline_metrics,
         baseline_prediction_tables=baseline_prediction_tables,
+        validation_baseline_details=validation_baseline_details,
+        test_baseline_details=test_baseline_details,
     )
 
     comparison_workbook_path = output_dir / "Comparison Table.xlsx"
     workbook_inputs = {
         "metrics": metrics,
         "selected_ai_model": selected_ai_model,
-        "class_distribution": build_class_distribution_sheet(
-            validation_features=validation_features,
-            test_features=test_features,
-        ),
+        "class_distribution": class_distribution,
+        "decision_legend": build_decision_legend_sheet(),
         "interpretation_sheet": build_interpretation_sheet(
             metrics=metrics,
             selected_ai_model=selected_ai_model,
-            class_distribution=build_class_distribution_sheet(
-                validation_features=validation_features,
-                test_features=test_features,
-            ),
+            class_distribution=class_distribution,
         ),
         "validation_comparison_table": build_comparison_prediction_table(
             ai_model=selected_ai_model,
             ai_prediction_tables=ai_prediction_tables,
-            baseline_prediction_frame=baseline_prediction_tables["validation"],
+            baseline_detail_frame=validation_baseline_details,
             split="validation",
         ),
         "test_comparison_table": build_comparison_prediction_table(
             ai_model=selected_ai_model,
             ai_prediction_tables=ai_prediction_tables,
-            baseline_prediction_frame=baseline_prediction_tables["test"],
+            baseline_detail_frame=test_baseline_details,
             split="test",
         ),
         "validation_baseline_confusion": build_confusion_frame_from_prediction_table(
@@ -117,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["logistic_regression", "random_forest"],
         help=(
-            "AI model to compare directly against the OBD-II proxy. "
+            "AI model to compare directly against the reactive OBD-II-style baseline. "
             "Defaults to the model with the lowest test challenge cost."
         ),
     )
@@ -144,32 +165,79 @@ def load_prediction_tables(report_dir: Path) -> dict[str, dict[str, pd.DataFrame
 def build_comparison_prediction_table(
     ai_model: str,
     ai_prediction_tables: dict[str, dict[str, pd.DataFrame]],
-    baseline_prediction_frame: pd.DataFrame,
+    baseline_detail_frame: pd.DataFrame,
     split: str,
 ) -> pd.DataFrame:
     ai_prediction_frame = ai_prediction_tables[ai_model][split].rename(
         columns={"predicted_label": "ai_prediction"}
     )
-    comparison_frame = baseline_prediction_frame.rename(
-        columns={
-            "predicted_label": "reactive_obdii_prediction",
-        }
-    ).merge(
+    comparison_frame = baseline_detail_frame.merge(
         ai_prediction_frame[["vehicle_id", "ai_prediction"]],
         on="vehicle_id",
         how="left",
     )
+    comparison_frame["ai_window"] = comparison_frame["ai_prediction"].map(CLASS_TO_WINDOW)
+    comparison_frame["ai_risk_band"] = comparison_frame["ai_prediction"].map(CLASS_TO_RISK_BAND)
+    comparison_frame["ai_status"] = comparison_frame["ai_prediction"].map(CLASS_TO_REACTIVE_STATUS)
+    comparison_frame["ai_recommendation"] = comparison_frame["ai_prediction"].map(
+        CLASS_TO_RECOMMENDATION
+    )
     comparison_frame["prediction_agreement"] = (
         comparison_frame["reactive_obdii_prediction"] == comparison_frame["ai_prediction"]
-    ).astype(int)
+    ).map({True: "Yes", False: "No"})
     comparison_frame["reactive_obdii_correct"] = (
         comparison_frame["reactive_obdii_prediction"] == comparison_frame["true_label"]
-    ).astype(int)
+    ).map({True: "Yes", False: "No"})
     comparison_frame["ai_correct"] = (
         comparison_frame["ai_prediction"] == comparison_frame["true_label"]
-    ).astype(int)
+    ).map({True: "Yes", False: "No"})
     comparison_frame["ai_model"] = get_display_name(ai_model)
-    return comparison_frame
+    comparison_frame["comparison_summary"] = comparison_frame.apply(
+        lambda row: build_comparison_summary(
+            reactive_prediction=int(row["reactive_obdii_prediction"]),
+            reactive_rule_band=str(row["rule_risk_band"]),
+            bucket_rule_alignment=str(row["bucket_rule_alignment"]),
+            ai_prediction=int(row["ai_prediction"]),
+            true_label=int(row["true_label"]),
+            ai_model_name=get_display_name(ai_model),
+        ),
+        axis=1,
+    )
+    ordered_columns = [
+        "vehicle_id",
+        "true_label",
+        "true_window",
+        "true_risk_band",
+        "reactive_obdii_prediction",
+        "reactive_bucket_window",
+        "reactive_bucket_risk_band",
+        "reactive_bucket_status",
+        "reactive_bucket_recommendation",
+        "rule_risk_band",
+        "rule_status",
+        "rule_recommendation",
+        "mil_status",
+        "pending_issue_count",
+        "confirmed_issue_count",
+        "severe_issue_count",
+        "rule_trigger_summary",
+        "reactive_anomaly_score",
+        "bucket_rule_alignment",
+        "top_triggered_signals",
+        "top_triggered_families",
+        "reactive_explanation",
+        "ai_model",
+        "ai_prediction",
+        "ai_window",
+        "ai_risk_band",
+        "ai_status",
+        "ai_recommendation",
+        "prediction_agreement",
+        "reactive_obdii_correct",
+        "ai_correct",
+        "comparison_summary",
+    ]
+    return comparison_frame.loc[:, ordered_columns]
 
 
 def write_comparison_workbook(
@@ -177,6 +245,7 @@ def write_comparison_workbook(
     metrics: dict[str, dict[str, object]],
     selected_ai_model: str,
     class_distribution: pd.DataFrame,
+    decision_legend: pd.DataFrame,
     interpretation_sheet: pd.DataFrame,
     validation_comparison_table: pd.DataFrame,
     test_comparison_table: pd.DataFrame,
@@ -198,6 +267,11 @@ def write_comparison_workbook(
         class_distribution.to_excel(
             writer,
             sheet_name="Class Distribution",
+            index=False,
+        )
+        decision_legend.to_excel(
+            writer,
+            sheet_name="Decision Legend",
             index=False,
         )
         interpretation_sheet.to_excel(
@@ -230,6 +304,7 @@ def write_comparison_workbook_with_fallback(
     metrics: dict[str, dict[str, object]],
     selected_ai_model: str,
     class_distribution: pd.DataFrame,
+    decision_legend: pd.DataFrame,
     interpretation_sheet: pd.DataFrame,
     validation_comparison_table: pd.DataFrame,
     test_comparison_table: pd.DataFrame,
@@ -242,6 +317,7 @@ def write_comparison_workbook_with_fallback(
             metrics=metrics,
             selected_ai_model=selected_ai_model,
             class_distribution=class_distribution,
+            decision_legend=decision_legend,
             interpretation_sheet=interpretation_sheet,
             validation_comparison_table=validation_comparison_table,
             test_comparison_table=test_comparison_table,
@@ -256,6 +332,7 @@ def write_comparison_workbook_with_fallback(
             metrics=metrics,
             selected_ai_model=selected_ai_model,
             class_distribution=class_distribution,
+            decision_legend=decision_legend,
             interpretation_sheet=interpretation_sheet,
             validation_comparison_table=validation_comparison_table,
             test_comparison_table=test_comparison_table,
@@ -364,6 +441,42 @@ def build_class_distribution_sheet(
     return pd.DataFrame(rows)
 
 
+def build_decision_legend_sheet() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for class_label in [0, 1, 2, 3, 4]:
+        rows.append(
+            {
+                "class_label": class_label,
+                "time_to_failure_window": CLASS_TO_WINDOW[class_label],
+                "risk_band": CLASS_TO_RISK_BAND[class_label],
+                "reactive_status": CLASS_TO_REACTIVE_STATUS[class_label],
+                "recommended_action": CLASS_TO_RECOMMENDATION[class_label],
+                "mil_expected": "Usually Off" if class_label < 3 else "Usually On",
+            }
+        )
+    rows.append(
+        {
+            "class_label": "reactive_bucket",
+            "time_to_failure_window": "reactive_bucket_* columns come from the saved reactive baseline prediction class",
+            "risk_band": "These bucket fields stay metric-consistent with the original baseline results",
+            "reactive_status": "Use them when comparing directly against the AI prediction class",
+            "recommended_action": "The bucket is still a proxy, not a real OBD-II ECU output",
+            "mil_expected": "It may disagree with the rule-style trigger view on some rows",
+        }
+    )
+    rows.append(
+        {
+            "class_label": "rule_view",
+            "time_to_failure_window": "pending_issue_count = number of last-value signals beyond 3 sigma",
+            "risk_band": "confirmed_issue_count = number of signals beyond 4 sigma",
+            "reactive_status": "severe_issue_count = number of signals beyond 5 sigma",
+            "recommended_action": "top_triggered_signals and top_triggered_families are descriptive proxy fields",
+            "mil_expected": "MIL is a rule-style proxy indicator, not a real ECU lamp state",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
 def build_interpretation_sheet(
     metrics: dict[str, dict[str, object]],
     selected_ai_model: str,
@@ -391,6 +504,8 @@ def build_interpretation_sheet(
         ("Single baseline name", "The reactive side is labeled consistently as 'Reactive OBD-II-style baseline'. The duplicate 'obdii_proxy' naming has been removed from the workbook."),
         ("Imbalance context", f"Class 0 dominates both evaluation splits: validation majority share = {validation_majority_share:.4f}, test majority share = {test_majority_share:.4f}. This makes accuracy alone misleading."),
         ("Reactive baseline", f"The Reactive OBD-II-style baseline performs poorly on the test split: accuracy = {reactive_test['accuracy']}, macro F1 = {reactive_test['macro_f1']}, mean challenge cost = {reactive_test['challenge_cost_mean']}."),
+        ("Reactive details", "The prediction sheets now add OBD-style proxy fields such as bucket risk band, rule-level risk band, MIL state, pending/confirmed issue counts, top triggered signals, and a plain-language explanation."),
+        ("Bucket vs rule view", "The reactive bucket keeps the original saved class prediction intact, while the rule view restates the same row in a more OBD-style way using threshold counts. If bucket_rule_alignment is 'Mismatch', use the reactive explanation column to interpret that row."),
         ("Random forest interpretation", f"Random Forest has the highest test accuracy ({random_forest_test['accuracy']}) but collapses into the majority class: class 0 recall = {random_forest_test_report['0']['recall']:.4f}, while classes 1-4 recall are all 0.0."),
         ("Why logistic regression", f"Logistic Regression is the main AI comparison because it has the lowest test challenge cost ({logistic_test['challenge_cost_mean']}) and better minority detection than Random Forest."),
         ("Minority detection evidence", f"On the test split, Logistic Regression detects some minority failure windows, including class 1 recall = {logistic_test_report['1']['recall']:.4f} and class 4 recall = {logistic_test_report['4']['recall']:.4f}, while Random Forest gives 0.0 recall for classes 1-4."),
@@ -416,6 +531,8 @@ def save_reactive_baseline_outputs(
     output_dir: Path,
     baseline_metrics: dict[str, dict[str, object]],
     baseline_prediction_tables: dict[str, pd.DataFrame],
+    validation_baseline_details: pd.DataFrame,
+    test_baseline_details: pd.DataFrame,
 ) -> None:
     (output_dir / "reactive_obdii_baseline_metrics.json").write_text(
         json.dumps(baseline_metrics, indent=2),
@@ -427,6 +544,14 @@ def save_reactive_baseline_outputs(
     )
     baseline_prediction_tables["test"].to_csv(
         output_dir / "reactive_obdii_baseline_test_predictions.csv",
+        index=False,
+    )
+    validation_baseline_details.to_csv(
+        output_dir / "reactive_obdii_baseline_validation_details.csv",
+        index=False,
+    )
+    test_baseline_details.to_csv(
+        output_dir / "reactive_obdii_baseline_test_details.csv",
         index=False,
     )
     build_confusion_frame_from_prediction_table(
@@ -451,6 +576,43 @@ def get_system_type(system_name: str) -> str:
         "logistic_regression": "ai model",
         "random_forest": "ai model",
     }[system_name]
+
+
+def build_comparison_summary(
+    reactive_prediction: int,
+    reactive_rule_band: str,
+    bucket_rule_alignment: str,
+    ai_prediction: int,
+    true_label: int,
+    ai_model_name: str,
+) -> str:
+    reactive_band = CLASS_TO_RISK_BAND[reactive_prediction]
+    ai_band = CLASS_TO_RISK_BAND[ai_prediction]
+
+    if reactive_prediction == ai_prediction:
+        agreement_text = f"{ai_model_name} and the reactive baseline agree on {ai_band.lower()} risk."
+    elif ai_prediction > reactive_prediction:
+        agreement_text = f"{ai_model_name} predicts a higher risk band than the reactive baseline."
+    else:
+        agreement_text = f"The reactive baseline predicts a higher risk band than {ai_model_name}."
+
+    if ai_prediction == true_label and reactive_prediction != true_label:
+        correctness_text = "AI matches the true class while the reactive baseline does not."
+    elif reactive_prediction == true_label and ai_prediction != true_label:
+        correctness_text = "The reactive baseline matches the true class while the AI model does not."
+    elif reactive_prediction == true_label and ai_prediction == true_label:
+        correctness_text = "Both systems match the true class."
+    else:
+        correctness_text = "Neither system matches the true class exactly."
+
+    mismatch_text = ""
+    if bucket_rule_alignment != "Aligned":
+        mismatch_text = (
+            f" The reactive bucket is {reactive_band.lower()} but the rule-style trigger view "
+            f"reads as {reactive_rule_band.lower()}, so check the explanation column."
+        )
+
+    return f"{agreement_text} {correctness_text}{mismatch_text}"
 
 
 if __name__ == "__main__":
