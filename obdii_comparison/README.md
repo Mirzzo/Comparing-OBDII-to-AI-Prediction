@@ -14,6 +14,11 @@ It does not retrain, modify, or replace the AI models. Instead, it:
 5. Writes `Comparison Table.xlsx` plus standalone baseline comparison outputs to
    `obdii_comparison/artifacts/`.
 
+If `--ai-model` is not provided, the tool selects the AI model with the lowest
+test mean challenge cost from `artifacts/reports/metrics.json`. With the current
+saved benchmark artifacts, that default main-comparison model is usually
+`catboost_two_stage`.
+
 ## Important note
 
 This tool does **not** add real OBD-II logs to the SCANIA dataset. It produces
@@ -53,7 +58,13 @@ Run the comparison tool from the repository root:
 python -m obdii_comparison.main
 ```
 
-Optional:
+Explicitly select the current main-comparison AI model:
+
+```bash
+python -m obdii_comparison.main --ai-model catboost_two_stage
+```
+
+Alternative comparisons are still supported:
 
 ```bash
 python -m obdii_comparison.main --ai-model logistic_regression
@@ -62,3 +73,31 @@ python -m obdii_comparison.main --ai-model logistic_regression
 The workbook is written to:
 
 `obdii_comparison/artifacts/Comparison Table.xlsx`
+
+If the workbook is already open in Excel, the tool writes:
+
+`obdii_comparison/artifacts/Comparison Table (Refreshed).xlsx`
+
+## Workbook contents
+
+The workbook currently includes these sheets:
+
+- `Summary`
+- `Baseline vs AI`
+- `Class Distribution`
+- `Decision Legend`
+- `Interpretation`
+- `Validation Predictions`
+- `Test Predictions`
+- `Validation Baseline CM`
+- `Test Baseline CM`
+
+## Additional outputs
+
+The tool also writes standalone baseline exports such as:
+
+- `reactive_obdii_baseline_metrics.json`
+- `reactive_obdii_baseline_validation_predictions.csv`
+- `reactive_obdii_baseline_test_predictions.csv`
+- `reactive_obdii_baseline_validation_details.csv`
+- `reactive_obdii_baseline_test_details.csv`

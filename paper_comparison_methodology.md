@@ -422,6 +422,21 @@ The workflow is:
 5. Merge the baseline details with the AI predictions by `vehicle_id`
 6. Write the comparison workbook and standalone CSV outputs to `obdii_comparison/artifacts/`
 
+The workbook currently contains:
+
+- `Summary`
+- `Baseline vs AI`
+- `Class Distribution`
+- `Decision Legend`
+- `Interpretation`
+- `Validation Predictions`
+- `Test Predictions`
+- `Validation Baseline CM`
+- `Test Baseline CM`
+
+If `Comparison Table.xlsx` is open when the tool runs, it automatically writes a
+fallback copy named `Comparison Table (Refreshed).xlsx`.
+
 ### How the AI model is selected for comparison
 
 The comparison tool can compare the reactive baseline against:
@@ -435,6 +450,23 @@ If no model is specified manually, it chooses the AI model with the **lowest
 test mean challenge cost** from the saved metrics.
 
 With the current results, that default model is **Two-stage CatBoost**.
+
+## Separate experiment runner
+
+The repository also includes a separate experiment workflow exposed through
+`python main.py run-experiments`. This is intentionally kept separate from the
+main benchmark so that trial changes do not overwrite the paper's primary
+comparison outputs in `artifacts/reports/`.
+
+That experiment runner tests three ideas on the original dataset split:
+
+- class-weighted multiclass training
+- moderate random oversampling on the training split only
+- binary risk prediction
+
+Its outputs are written to `artifacts/experiments/` and should be described as
+supporting or exploratory experiments rather than as replacements for the main
+comparison benchmark.
 
 ## What the AI model means in the workbook
 
@@ -501,16 +533,22 @@ Main implementation files:
 - `src/maintenance_prediction/features.py`
 - `src/maintenance_prediction/modeling.py`
 - `src/maintenance_prediction/baseline.py`
+- `src/maintenance_prediction/experiments.py`
 - `obdii_comparison/main.py`
 - `obdii_comparison/reactive_details.py`
+- `scripts/generate_binary_class_chart.py`
+- `scripts/generate_main_comparison_table_charts.py`
 
 Main outputs:
 
 - `artifacts/reports/metrics.json`
 - `artifacts/reports/catboost_two_stage_test_predictions.csv`
+- `artifacts/experiments/experiment_summary.md`
 - `obdii_comparison/artifacts/Comparison Table.xlsx`
 - `obdii_comparison/artifacts/Comparison Table (Refreshed).xlsx`
 - `obdii_comparison/artifacts/reactive_obdii_baseline_test_details.csv`
+- `obdii_comparison/artifacts/main_comparison_validation_score_line_chart_paper_style.png`
+- `obdii_comparison/artifacts/main_comparison_test_score_line_chart_paper_style.png`
 
 ## Short version for the paper
 

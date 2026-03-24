@@ -2,15 +2,18 @@
 
 This repository contains a Python-based predictive maintenance workflow for the SCANIA Component X dataset stored under `Dataset/data`.
 
-The system does four things:
+The system does five things:
 
 1. Streams the raw operational readouts vehicle by vehicle.
 2. Builds snapshot-level training examples from the training split.
-3. Trains three classifiers:
+3. Trains the main benchmark models:
    - a reactive threshold baseline
-   - Logistic Regression with minority-class oversampling
-   - Random Forest with class-balanced bootstrapping
+   - Logistic Regression with expected-cost decoding
+   - Random Forest with expected-cost decoding
+   - single-stage CatBoost
+   - two-stage CatBoost
 4. Evaluates them on the provided validation and test splits and saves reports to `artifacts/`.
+5. Supports separate comparison and experiment workflows without overwriting the main benchmark outputs.
 
 The evaluation report includes both standard classification metrics and the challenge-style asymmetric maintenance cost.
 
@@ -26,7 +29,7 @@ The dataset documentation defines five classes for the last observed readout of 
 
 The training split does not ship with these five labels directly. Instead, this project infers them from `train_tte.csv` by comparing each selected readout time with `length_of_study_time_step`. For vehicles with `in_study_repair = 0`, the final 48 time steps are excluded from training because they are right-censored and cannot be assigned a reliable failure window.
 
-To handle the strong class imbalance, the training pipeline now oversamples minority classes for Logistic Regression while keeping Random Forest on class-balanced bootstrapping. This improves the minority-class sensitivity of the linear model without forcing the same strategy on every estimator.
+The main benchmark keeps the original dataset split intact and uses cost-aware prediction decoding for Logistic Regression and Random Forest. The CatBoost variants use `auto_class_weights="SqrtBalanced"` to handle imbalance. Separate class-weighted, oversampling, and binary-risk experiments are available through `python main.py run-experiments` and are written to `artifacts/experiments/` without replacing the main benchmark outputs.
 
 ## Project layout
 
@@ -35,7 +38,9 @@ To handle the strong class imbalance, the training pipeline now oversamples mino
 - `src/maintenance_prediction/baseline.py`: reactive rule-based baseline
 - `src/maintenance_prediction/modeling.py`: training, evaluation, and report export
 - `src/maintenance_prediction/cli.py`: command-line interface
+- `src/maintenance_prediction/experiments.py`: separate class-weighted, oversampling, and binary-risk experiment runner
 - `obdii_comparison/`: separate OBD-II-style comparison workbook generator
+- `scripts/`: reproducible figure generators used for the paper
 
 ## Dataset download
 
@@ -93,7 +98,23 @@ training pipeline:
 
 ```bash
 python -m pip install -r obdii_comparison/requirements.txt
-python -m obdii_comparison.main --ai-model logistic_regression
+python -m obdii_comparison.main
+```
+
+By default, the comparison tool selects the AI model with the lowest test mean
+challenge cost from `artifacts/reports/metrics.json`. To force the current main
+comparison model explicitly:
+
+```bash
+python -m obdii_comparison.main --ai-model catboost_two_stage
+```
+
+Generate the paper figures used for the binary class distribution and the
+main-comparison line charts:
+
+```bash
+python scripts/generate_binary_class_chart.py
+python scripts/generate_main_comparison_table_charts.py
 ```
 
 Optional arguments:
@@ -111,6 +132,8 @@ After `run`, the project writes:
 - `artifacts/reports/metrics.json`: summary metrics
 - `artifacts/reports/*_confusion_matrix_*.csv`: confusion matrices
 - `artifacts/reports/*_predictions_*.csv`: per-vehicle predictions
+- `artifacts/experiments/*`: separate experiment results from `run-experiments`
+- `obdii_comparison/artifacts/Comparison Table.xlsx`: standalone reactive-vs-AI workbook
 
 ## Notes
 
