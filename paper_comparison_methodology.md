@@ -158,11 +158,13 @@ examples.
 
 ## Models used in the prediction system
 
-The main training pipeline produces three systems:
+The main training pipeline currently produces five systems:
 
 1. `reactive_baseline`
 2. `logistic_regression`
 3. `random_forest`
+4. `catboost`
+5. `catboost_two_stage`
 
 ### Logistic regression
 
@@ -172,8 +174,10 @@ The logistic regression model uses:
 - standardization for numeric features
 - most-frequent imputation plus one-hot encoding for categorical `Spec_*` features
 
-To improve imbalance handling, the training data is oversampled so that minority
-classes are replicated up to the majority-class count.
+In the current code, logistic regression trains on the natural class
+distribution without oversampling. At prediction time, it does not use plain
+maximum-probability decoding. Instead, it uses the challenge cost matrix to
+choose the class with the lowest expected maintenance cost.
 
 ### Random forest
 
@@ -183,8 +187,40 @@ The random forest model uses:
 - one-hot encoded categorical specification features
 - `class_weight="balanced_subsample"`
 
-This helps with imbalance, but in the current results the model still collapses
-strongly toward the majority class.
+Like logistic regression, the random forest now trains on the natural class
+distribution and uses expected-cost decoding at prediction time.
+
+### CatBoost
+
+The single-stage CatBoost model uses:
+
+- native handling of categorical `Spec_*` features rather than one-hot encoding
+- `auto_class_weights="SqrtBalanced"`
+- validation-guided early stopping
+
+In the current results, this model reaches the highest raw test accuracy among
+the AI systems, but it still behaves mostly like a majority-class classifier on
+the minority fault windows.
+
+### Two-stage CatBoost
+
+The two-stage CatBoost model is a hierarchical predictive-maintenance model:
+
+- stage 1 predicts whether the vehicle is class `0` or a future-failure class
+  (`1` to `4`)
+- stage 2 predicts the specific failure-window class among `1` to `4`
+- the final fault threshold is tuned on the validation set to maximize macro F1,
+  then lower challenge cost, then higher accuracy
+
+This model is currently the strongest main AI comparison in the repository
+because it achieves the best balance between minority detection and practical
+error cost. In the current test results, it reaches:
+
+- accuracy = `0.891378`
+- macro precision = `0.213186`
+- macro recall = `0.250957`
+- macro F1 = `0.215768`
+- mean challenge cost = `8.954410`
 
 ## Why accuracy is not enough
 
@@ -388,15 +424,17 @@ The workflow is:
 
 ### How the AI model is selected for comparison
 
-The comparison tool can compare the reactive baseline against either:
+The comparison tool can compare the reactive baseline against:
 
 - logistic regression
 - random forest
+- CatBoost
+- Two-stage CatBoost
 
 If no model is specified manually, it chooses the AI model with the **lowest
 test mean challenge cost** from the saved metrics.
 
-With the current results, that default model is **logistic regression**.
+With the current results, that default model is **Two-stage CatBoost**.
 
 ## What the AI model means in the workbook
 
@@ -412,20 +450,25 @@ time-to-failure class for that vehicle. The workbook adds:
 These are presentation fields added to make the AI decision easier to compare
 with the reactive OBD-II-style baseline.
 
-## Why logistic regression is the main AI comparison
+## Why Two-stage CatBoost is the main AI comparison
 
-The current results show three different patterns:
+The current results show five different patterns:
 
 - the reactive baseline performs very poorly
-- random forest has the highest accuracy, but largely collapses into the majority class
-- logistic regression provides the most meaningful practical comparison because it achieves the lowest challenge cost and better minority-class detection
+- cost-sensitive logistic regression and random forest become very aggressive
+  toward the near-failure class and lose too much overall accuracy
+- single-stage CatBoost has the highest test accuracy (`0.966700`), but it still
+  misses most minority failure windows
+- Two-stage CatBoost preserves high overall accuracy while improving minority
+  sensitivity and achieving the lowest mean challenge cost (`8.954410`)
 
-This is why logistic regression is the preferred AI model for the main
+This is why Two-stage CatBoost is the preferred AI model for the main
 OBD-II-style comparison in the paper.
 
-The argument is not that logistic regression is universally the best classifier.
-The argument is that, under this dataset and this cost structure, it provides a
-more useful predictive-maintenance tradeoff than the random forest.
+The argument is not that Two-stage CatBoost is universally the best classifier.
+The argument is that, under this dataset and this cost structure, it provides
+the most useful predictive-maintenance tradeoff among the models currently
+implemented in the repository.
 
 ## How to describe the comparison in the paper
 
@@ -447,8 +490,8 @@ The comparison should be interpreted as follows:
 
 - The reactive baseline represents conventional reactive diagnostics, which are simple and interpretable but weak for early predictive detection.
 - The AI system uses the historical sensor trajectory and specification context to estimate proximity to failure.
-- Random forest can appear strong on accuracy because the dataset is highly imbalanced.
-- Logistic regression is the more meaningful main comparison because it better reflects the project goal of practical early warning under asymmetric error costs.
+- Single-stage CatBoost can appear very strong on accuracy because the dataset is highly imbalanced and class 0 dominates the holdout splits.
+- Two-stage CatBoost is the more meaningful main comparison because it improves minority-class sensitivity and produces the lowest challenge cost among the available AI models while keeping high overall accuracy.
 - The readable OBD-style layer improves interpretability of the baseline, but it remains a proxy rather than real ECU-level OBD-II output.
 
 ## Files related to the comparison
@@ -464,7 +507,7 @@ Main implementation files:
 Main outputs:
 
 - `artifacts/reports/metrics.json`
-- `artifacts/reports/logistic_regression_test_predictions.csv`
+- `artifacts/reports/catboost_two_stage_test_predictions.csv`
 - `obdii_comparison/artifacts/Comparison Table.xlsx`
 - `obdii_comparison/artifacts/Comparison Table (Refreshed).xlsx`
 - `obdii_comparison/artifacts/reactive_obdii_baseline_test_details.csv`
@@ -483,6 +526,6 @@ deviation from that reference, and maps anomaly scores into the same five
 classes. A standalone comparison tool then combines the saved baseline outputs
 with the AI predictions and presents them in an OBD-style readable format with
 proxy MIL state, trigger counts, risk bands, and row-level explanations. In the
-current results, logistic regression is the preferred AI comparison model
-because it offers a better practical tradeoff than random forest under the
-dataset's class imbalance and asymmetric maintenance cost.
+current results, Two-stage CatBoost is the preferred AI comparison model
+because it achieves the lowest mean challenge cost and the strongest macro-F1
+among the available AI models while still retaining high overall accuracy.

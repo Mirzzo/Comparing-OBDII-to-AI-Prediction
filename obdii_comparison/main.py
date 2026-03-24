@@ -14,6 +14,13 @@ from obdii_comparison.reactive_details import (
     ReactiveBaselineExplainer,
 )
 
+AI_MODEL_NAMES = [
+    "logistic_regression",
+    "random_forest",
+    "catboost",
+    "catboost_two_stage",
+]
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -136,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ai-model",
         default=None,
-        choices=["logistic_regression", "random_forest"],
+        choices=AI_MODEL_NAMES,
         help=(
             "AI model to compare directly against the reactive OBD-II-style baseline. "
             "Defaults to the model with the lowest test challenge cost."
@@ -146,15 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def choose_default_ai_model(metrics: dict[str, dict[str, object]]) -> str:
+    available_ai_models = [model_name for model_name in AI_MODEL_NAMES if model_name in metrics]
     return min(
-        ["logistic_regression", "random_forest"],
+        available_ai_models,
         key=lambda model_name: metrics[model_name]["test"]["challenge_cost_mean"],
     )
 
 
-def load_prediction_tables(report_dir: Path) -> dict[str, dict[str, pd.DataFrame]]:
+def load_prediction_tables(
+    report_dir: Path,
+    model_names: list[str] | None = None,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    requested_model_names = model_names or ["reactive_baseline", *AI_MODEL_NAMES]
     tables: dict[str, dict[str, pd.DataFrame]] = {}
-    for model_name in ["reactive_baseline", "logistic_regression", "random_forest"]:
+    for model_name in requested_model_names:
         tables[model_name] = {
             "validation": pd.read_csv(report_dir / f"{model_name}_validation_predictions.csv"),
             "test": pd.read_csv(report_dir / f"{model_name}_test_predictions.csv"),
@@ -482,8 +494,6 @@ def build_interpretation_sheet(
     selected_ai_model: str,
     class_distribution: pd.DataFrame,
 ) -> pd.DataFrame:
-    logistic_test = metrics["logistic_regression"]["test"]
-    random_forest_test = metrics["random_forest"]["test"]
     reactive_test = metrics["reactive_baseline"]["test"]
     validation_majority_share = class_distribution.loc[
         (class_distribution["split"] == "validation")
@@ -495,9 +505,22 @@ def build_interpretation_sheet(
         & (class_distribution["class_label"] == "majority_class_share"),
         "share",
     ].iloc[0]
-
-    logistic_test_report = logistic_test["classification_report"]
-    random_forest_test_report = random_forest_test["classification_report"]
+    available_ai_models = [model_name for model_name in AI_MODEL_NAMES if model_name in metrics]
+    best_accuracy_model = max(
+        available_ai_models,
+        key=lambda model_name: metrics[model_name]["test"]["accuracy"],
+    )
+    best_macro_f1_model = max(
+        available_ai_models,
+        key=lambda model_name: metrics[model_name]["test"]["macro_f1"],
+    )
+    best_cost_model = min(
+        available_ai_models,
+        key=lambda model_name: metrics[model_name]["test"]["challenge_cost_mean"],
+    )
+    best_accuracy_report = metrics[best_accuracy_model]["test"]["classification_report"]
+    selected_test = metrics[selected_ai_model]["test"]
+    selected_test_report = selected_test["classification_report"]
 
     notes = [
         ("Metric consistency", "The workbook now reads all comparison metrics directly from artifacts/reports/metrics.json and the saved prediction CSVs, so the workbook values match the earlier reported results."),
@@ -506,9 +529,11 @@ def build_interpretation_sheet(
         ("Reactive baseline", f"The Reactive OBD-II-style baseline performs poorly on the test split: accuracy = {reactive_test['accuracy']}, macro F1 = {reactive_test['macro_f1']}, mean challenge cost = {reactive_test['challenge_cost_mean']}."),
         ("Reactive details", "The prediction sheets now add OBD-style proxy fields such as bucket risk band, rule-level risk band, MIL state, pending/confirmed issue counts, top triggered signals, and a plain-language explanation."),
         ("Bucket vs rule view", "The reactive bucket keeps the original saved class prediction intact, while the rule view restates the same row in a more OBD-style way using threshold counts. If bucket_rule_alignment is 'Mismatch', use the reactive explanation column to interpret that row."),
-        ("Random forest interpretation", f"Random Forest has the highest test accuracy ({random_forest_test['accuracy']}) but collapses into the majority class: class 0 recall = {random_forest_test_report['0']['recall']:.4f}, while classes 1-4 recall are all 0.0."),
-        ("Why logistic regression", f"Logistic Regression is the main AI comparison because it has the lowest test challenge cost ({logistic_test['challenge_cost_mean']}) and better minority detection than Random Forest."),
-        ("Minority detection evidence", f"On the test split, Logistic Regression detects some minority failure windows, including class 1 recall = {logistic_test_report['1']['recall']:.4f} and class 4 recall = {logistic_test_report['4']['recall']:.4f}, while Random Forest gives 0.0 recall for classes 1-4."),
+        ("Highest-accuracy AI model", f"{get_display_name(best_accuracy_model)} has the highest test accuracy ({metrics[best_accuracy_model]['test']['accuracy']}) but should still be read alongside macro metrics because the evaluation splits are heavily imbalanced. Its class 0 recall is {best_accuracy_report['0']['recall']:.4f}."),
+        ("Lowest-cost AI model", f"{get_display_name(best_cost_model)} has the lowest test challenge cost ({metrics[best_cost_model]['test']['challenge_cost_mean']}) among the AI models currently available in artifacts/reports."),
+        ("Best macro-F1 AI model", f"{get_display_name(best_macro_f1_model)} has the strongest test macro F1 ({metrics[best_macro_f1_model]['test']['macro_f1']}) among the AI models currently available in artifacts/reports."),
+        ("Selected AI model behavior", f"{get_display_name(selected_ai_model)} is the main AI comparison model in this workbook. On the test split it has accuracy = {selected_test['accuracy']}, macro precision = {selected_test['macro_precision']}, macro recall = {selected_test['macro_recall']}, macro F1 = {selected_test['macro_f1']}, and mean challenge cost = {selected_test['challenge_cost_mean']}."),
+        ("Selected minority detection", f"For the selected AI model, test recall by minority class is class 1 = {selected_test_report['1']['recall']:.4f}, class 2 = {selected_test_report['2']['recall']:.4f}, class 3 = {selected_test_report['3']['recall']:.4f}, and class 4 = {selected_test_report['4']['recall']:.4f}."),
         ("Main comparison model", f"The selected AI model for the main comparison is {get_display_name(selected_ai_model)}."),
     ]
     return pd.DataFrame(notes, columns=["topic", "note"])
@@ -567,6 +592,8 @@ def get_display_name(system_name: str) -> str:
         "reactive_baseline": "Reactive OBD-II-style baseline",
         "logistic_regression": "Logistic Regression (AI)",
         "random_forest": "Random Forest (AI)",
+        "catboost": "CatBoost (AI)",
+        "catboost_two_stage": "Two-Stage CatBoost (AI)",
     }[system_name]
 
 
@@ -575,6 +602,8 @@ def get_system_type(system_name: str) -> str:
         "reactive_baseline": "reactive baseline",
         "logistic_regression": "ai model",
         "random_forest": "ai model",
+        "catboost": "ai model",
+        "catboost_two_stage": "ai model",
     }[system_name]
 
 

@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -18,7 +20,6 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.utils import resample
 
 from maintenance_prediction.baseline import ReactiveThresholdBaseline
 
@@ -30,12 +31,189 @@ CHALLENGE_COST_MATRIX = {
     3: {0: 400, 1: 300, 2: 200, 3: 0, 4: 7},
     4: {0: 500, 1: 400, 2: 300, 3: 200, 4: 0},
 }
+CLASS_LABELS = tuple(sorted(CHALLENGE_COST_MATRIX))
+ESTIMATOR_PREDICT = "estimator_predict"
+EXPECTED_COST_PREDICT = "expected_cost_minimization"
 
 
 @dataclass(frozen=True)
 class ModelTrainingConfig:
     estimator: object
-    oversample_ratio: float | None = None
+    prediction_decoding: str = ESTIMATOR_PREDICT
+    use_validation_for_fit: bool = False
+
+
+class TwoStageCatBoostClassifier:
+    def __init__(
+        self,
+        cat_features: list[str],
+        random_seed: int = 42,
+    ) -> None:
+        self.cat_features = cat_features
+        self.random_seed = random_seed
+        self.fault_threshold_ = 0.5
+        self.threshold_selection_strategy_ = (
+            "validation_macro_f1_then_mean_cost_then_accuracy"
+        )
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        eval_set: tuple[pd.DataFrame, pd.Series] | None = None,
+        use_best_model: bool = True,
+        early_stopping_rounds: int | None = 100,
+        verbose: bool | int = False,
+    ) -> "TwoStageCatBoostClassifier":
+        y_series = pd.Series(y, index=X.index).astype(int)
+        binary_y = (y_series != 0).astype(int)
+        self.stage1_model_ = self._build_fault_detector()
+        stage1_fit_kwargs = self._build_fit_kwargs(
+            X=X,
+            y=binary_y,
+            eval_set=eval_set,
+            transform_labels=lambda labels: (pd.Series(labels).astype(int) != 0).astype(int),
+            use_best_model=use_best_model,
+            early_stopping_rounds=early_stopping_rounds,
+            verbose=verbose,
+        )
+        self.stage1_model_.fit(X, binary_y, **stage1_fit_kwargs)
+
+        fault_mask = y_series != 0
+        fault_X = X.loc[fault_mask]
+        fault_y = y_series.loc[fault_mask]
+        self.stage2_model_ = self._build_fault_classifier()
+        stage2_eval_set: tuple[pd.DataFrame, pd.Series] | None = None
+        if eval_set is not None:
+            eval_X, eval_y = eval_set
+            eval_y_series = pd.Series(eval_y, index=eval_X.index).astype(int)
+            eval_fault_mask = eval_y_series != 0
+            if eval_fault_mask.any():
+                stage2_eval_set = (
+                    eval_X.loc[eval_fault_mask],
+                    eval_y_series.loc[eval_fault_mask],
+                )
+        stage2_fit_kwargs = self._build_fit_kwargs(
+            X=fault_X,
+            y=fault_y,
+            eval_set=stage2_eval_set,
+            transform_labels=lambda labels: pd.Series(labels).astype(int),
+            use_best_model=use_best_model,
+            early_stopping_rounds=early_stopping_rounds,
+            verbose=verbose,
+        )
+        self.stage2_model_.fit(fault_X, fault_y, **stage2_fit_kwargs)
+
+        self.classes_ = np.asarray(CLASS_LABELS, dtype=int)
+        if eval_set is not None:
+            eval_X, eval_y = eval_set
+            self.fault_threshold_ = self._select_fault_threshold(
+                X=eval_X,
+                y=pd.Series(eval_y, index=eval_X.index).astype(int),
+            )
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        fault_probabilities = self._predict_fault_probability(X)
+        fault_labels = np.asarray(self.stage2_model_.predict(X), dtype=int).reshape(-1)
+        predictions = np.where(fault_probabilities >= self.fault_threshold_, fault_labels, 0)
+        return predictions.astype(int)
+
+    def get_training_metadata(self) -> dict[str, object]:
+        return {
+            "fault_threshold": round(float(self.fault_threshold_), 6),
+            "threshold_selection": self.threshold_selection_strategy_,
+        }
+
+    def _build_fault_detector(self) -> CatBoostClassifier:
+        return CatBoostClassifier(
+            loss_function="Logloss",
+            eval_metric="Logloss",
+            iterations=1000,
+            learning_rate=0.05,
+            depth=6,
+            auto_class_weights="SqrtBalanced",
+            random_seed=self.random_seed,
+            thread_count=1,
+            allow_writing_files=False,
+            verbose=False,
+            cat_features=self.cat_features,
+        )
+
+    def _build_fault_classifier(self) -> CatBoostClassifier:
+        return CatBoostClassifier(
+            loss_function="MultiClass",
+            eval_metric="MultiClass",
+            iterations=1000,
+            learning_rate=0.05,
+            depth=6,
+            auto_class_weights="SqrtBalanced",
+            random_seed=self.random_seed,
+            thread_count=1,
+            allow_writing_files=False,
+            verbose=False,
+            cat_features=self.cat_features,
+        )
+
+    def _build_fit_kwargs(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        eval_set: tuple[pd.DataFrame, pd.Series] | None,
+        transform_labels,
+        use_best_model: bool,
+        early_stopping_rounds: int | None,
+        verbose: bool | int,
+    ) -> dict[str, object]:
+        fit_kwargs: dict[str, object] = {}
+        if eval_set is not None and len(X) > 0 and len(y) > 0:
+            eval_X, eval_y = eval_set
+            if len(eval_X) > 0 and len(eval_y) > 0:
+                fit_kwargs["eval_set"] = (eval_X, transform_labels(eval_y))
+                fit_kwargs["use_best_model"] = use_best_model
+                fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
+                fit_kwargs["verbose"] = verbose
+        return fit_kwargs
+
+    def _predict_fault_probability(self, X: pd.DataFrame) -> np.ndarray:
+        probabilities = np.asarray(self.stage1_model_.predict_proba(X), dtype=float)
+        fault_class_index = list(self.stage1_model_.classes_).index(1)
+        return probabilities[:, fault_class_index]
+
+    def _select_fault_threshold(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+    ) -> float:
+        fault_probabilities = self._predict_fault_probability(X)
+        fault_labels = np.asarray(self.stage2_model_.predict(X), dtype=int).reshape(-1)
+        candidate_thresholds = np.unique(
+            np.clip(
+                np.concatenate(
+                    [
+                        np.linspace(0.0, 1.0, 201),
+                        fault_probabilities,
+                    ]
+                ),
+                0.0,
+                1.0,
+            )
+        )
+
+        best_threshold = self.fault_threshold_
+        best_score: tuple[float, float, float] | None = None
+        for threshold in candidate_thresholds:
+            predictions = np.where(fault_probabilities >= threshold, fault_labels, 0).astype(int)
+            metrics = evaluate_predictions(y, predictions)
+            score = (
+                float(metrics["macro_f1"]),
+                -float(metrics["challenge_cost_mean"]),
+                float(metrics["accuracy"]),
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_threshold = float(threshold)
+        return best_threshold
 
 
 def train_and_evaluate(
@@ -61,24 +239,33 @@ def train_and_evaluate(
     metrics_summary: dict[str, dict[str, object]] = {}
     for model_name, training_config in models.items():
         model = training_config.estimator
-        X_train_model, y_train_model = prepare_training_data(
-            X_train=X_train,
-            y_train=y_train,
-            oversample_ratio=training_config.oversample_ratio,
-        )
-        train_class_counts = y_train_model.value_counts().sort_index().to_dict()
+        train_class_counts = original_train_class_counts
 
         print(f"Training {model_name}...")
-        if training_config.oversample_ratio is not None:
-            print(
-                f"  oversampling applied: ratio={training_config.oversample_ratio}, "
-                f"class_counts={train_class_counts}"
-            )
-        model.fit(X_train_model, y_train_model)
+        if training_config.prediction_decoding != ESTIMATOR_PREDICT:
+            print(f"  prediction decoding: {training_config.prediction_decoding}")
+        fit_kwargs: dict[str, object] = {}
+        if training_config.use_validation_for_fit:
+            fit_kwargs = {
+                "eval_set": (X_validation, y_validation),
+                "use_best_model": True,
+                "early_stopping_rounds": 100,
+                "verbose": False,
+            }
+            print("  validation-guided early stopping enabled")
+        model.fit(X_train, y_train, **fit_kwargs)
         joblib.dump(model, model_dir / f"{model_name}.joblib")
 
-        validation_predictions = model.predict(X_validation)
-        test_predictions = model.predict(X_test)
+        validation_predictions = generate_predictions(
+            model=model,
+            X_frame=X_validation,
+            prediction_decoding=training_config.prediction_decoding,
+        )
+        test_predictions = generate_predictions(
+            model=model,
+            X_frame=X_test,
+            prediction_decoding=training_config.prediction_decoding,
+        )
 
         validation_metrics = evaluate_predictions(y_validation, validation_predictions)
         test_metrics = evaluate_predictions(y_test, test_predictions)
@@ -107,8 +294,11 @@ def train_and_evaluate(
         metrics_summary[model_name] = {
             "training_setup": {
                 "original_train_class_counts": original_train_class_counts,
-                "oversample_ratio": training_config.oversample_ratio,
+                "sampling_strategy": "natural",
                 "train_class_counts_used": train_class_counts,
+                "prediction_decoding": training_config.prediction_decoding,
+                "validation_guided_fit": training_config.use_validation_for_fit,
+                **extract_model_metadata(model),
             },
             "validation": validation_metrics,
             "test": test_metrics,
@@ -214,7 +404,7 @@ def build_models(
                     ),
                 ]
             ),
-            oversample_ratio=1.0,
+            prediction_decoding=EXPECTED_COST_PREDICT,
         ),
         "random_forest": ModelTrainingConfig(
             estimator=Pipeline(
@@ -233,54 +423,73 @@ def build_models(
                     ),
                 ]
             ),
+            prediction_decoding=EXPECTED_COST_PREDICT,
+        ),
+        "catboost": ModelTrainingConfig(
+            estimator=CatBoostClassifier(
+                loss_function="MultiClass",
+                eval_metric="MultiClass",
+                iterations=1000,
+                learning_rate=0.05,
+                depth=6,
+                auto_class_weights="SqrtBalanced",
+                random_seed=42,
+                thread_count=1,
+                allow_writing_files=False,
+                verbose=False,
+                cat_features=categorical_columns,
+            ),
+            prediction_decoding=ESTIMATOR_PREDICT,
+            use_validation_for_fit=True,
+        ),
+        "catboost_two_stage": ModelTrainingConfig(
+            estimator=TwoStageCatBoostClassifier(
+                cat_features=categorical_columns,
+                random_seed=42,
+            ),
+            prediction_decoding=ESTIMATOR_PREDICT,
+            use_validation_for_fit=True,
         ),
     }
 
 
-def prepare_training_data(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    oversample_ratio: float | None,
-) -> tuple[pd.DataFrame, pd.Series]:
-    if oversample_ratio is None:
-        return X_train, y_train
-    return oversample_training_data(X_train, y_train, oversample_ratio)
+def generate_predictions(
+    model: object,
+    X_frame: pd.DataFrame,
+    prediction_decoding: str,
+) -> np.ndarray:
+    if prediction_decoding == ESTIMATOR_PREDICT:
+        return np.asarray(model.predict(X_frame), dtype=int).reshape(-1)
+    if prediction_decoding == EXPECTED_COST_PREDICT:
+        return predict_with_expected_cost(model, X_frame)
+    raise ValueError(f"Unsupported prediction decoding strategy: {prediction_decoding}")
 
 
-def oversample_training_data(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    oversample_ratio: float,
-) -> tuple[pd.DataFrame, pd.Series]:
-    if oversample_ratio <= 0:
-        raise ValueError("oversample_ratio must be positive when provided.")
+def predict_with_expected_cost(
+    model: object,
+    X_frame: pd.DataFrame,
+) -> np.ndarray:
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("Expected-cost decoding requires a model with predict_proba().")
 
-    training_frame = X_train.copy()
-    training_frame["class_label"] = y_train.to_numpy()
-
-    max_class_count = int(training_frame["class_label"].value_counts().max())
-    target_count = max(1, int(round(max_class_count * oversample_ratio)))
-
-    resampled_frames: list[pd.DataFrame] = []
-    for class_label, class_frame in training_frame.groupby("class_label", sort=True):
-        if len(class_frame) < target_count:
-            extra_rows = resample(
-                class_frame,
-                replace=True,
-                n_samples=target_count - len(class_frame),
-                random_state=42,
-            )
-            class_frame = pd.concat([class_frame, extra_rows], ignore_index=True)
-        resampled_frames.append(class_frame)
-
-    balanced_frame = (
-        pd.concat(resampled_frames, ignore_index=True)
-        .sample(frac=1.0, random_state=42)
-        .reset_index(drop=True)
+    probabilities = np.asarray(model.predict_proba(X_frame), dtype=float)
+    actual_classes = [int(label) for label in model.classes_]
+    prediction_labels = np.asarray(CLASS_LABELS, dtype=int)
+    cost_matrix = np.asarray(
+        [
+            [CHALLENGE_COST_MATRIX[actual_label][predicted_label] for predicted_label in prediction_labels]
+            for actual_label in actual_classes
+        ],
+        dtype=float,
     )
-    balanced_y = balanced_frame["class_label"].astype(int)
-    balanced_X = balanced_frame.drop(columns=["class_label"])
-    return balanced_X, balanced_y
+    expected_cost = probabilities @ cost_matrix
+    return prediction_labels[expected_cost.argmin(axis=1)]
+
+
+def extract_model_metadata(model: object) -> dict[str, object]:
+    if hasattr(model, "get_training_metadata"):
+        return dict(model.get_training_metadata())
+    return {}
 
 
 def evaluate_predictions(y_true: pd.Series, y_pred: pd.Series | list[int]) -> dict[str, object]:
