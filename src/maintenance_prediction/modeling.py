@@ -7,7 +7,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -22,6 +21,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from maintenance_prediction.baseline import ReactiveThresholdBaseline
+
+try:
+    from catboost import CatBoostClassifier
+except ModuleNotFoundError:
+    CatBoostClassifier = None
 
 
 CHALLENGE_COST_MATRIX = {
@@ -126,6 +130,10 @@ class TwoStageCatBoostClassifier:
         }
 
     def _build_fault_detector(self) -> CatBoostClassifier:
+        if CatBoostClassifier is None:
+            raise ModuleNotFoundError(
+                "catboost is not installed, so the CatBoost experiment variants are unavailable."
+            )
         return CatBoostClassifier(
             loss_function="Logloss",
             eval_metric="Logloss",
@@ -141,6 +149,10 @@ class TwoStageCatBoostClassifier:
         )
 
     def _build_fault_classifier(self) -> CatBoostClassifier:
+        if CatBoostClassifier is None:
+            raise ModuleNotFoundError(
+                "catboost is not installed, so the CatBoost experiment variants are unavailable."
+            )
         return CatBoostClassifier(
             loss_function="MultiClass",
             eval_metric="MultiClass",
@@ -387,7 +399,7 @@ def build_models(
         remainder="drop",
     )
 
-    return {
+    models = {
         "reactive_baseline": ModelTrainingConfig(
             estimator=ReactiveThresholdBaseline(),
         ),
@@ -425,7 +437,9 @@ def build_models(
             ),
             prediction_decoding=EXPECTED_COST_PREDICT,
         ),
-        "catboost": ModelTrainingConfig(
+    }
+    if CatBoostClassifier is not None:
+        models["catboost"] = ModelTrainingConfig(
             estimator=CatBoostClassifier(
                 loss_function="MultiClass",
                 eval_metric="MultiClass",
@@ -441,16 +455,16 @@ def build_models(
             ),
             prediction_decoding=ESTIMATOR_PREDICT,
             use_validation_for_fit=True,
-        ),
-        "catboost_two_stage": ModelTrainingConfig(
+        )
+        models["catboost_two_stage"] = ModelTrainingConfig(
             estimator=TwoStageCatBoostClassifier(
                 cat_features=categorical_columns,
                 random_seed=42,
             ),
             prediction_decoding=ESTIMATOR_PREDICT,
             use_validation_for_fit=True,
-        ),
-    }
+        )
+    return models
 
 
 def generate_predictions(

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from maintenance_prediction.experiments import run_training_experiments
 from maintenance_prediction.features import build_feature_tables
 from maintenance_prediction.modeling import train_and_evaluate
 
@@ -61,6 +62,31 @@ def main(argv: list[str] | None = None) -> int:
         print_metrics_summary(metrics)
         return 0
 
+    if command == "run-experiments":
+        if args.reuse_features and all(path.exists() for path in feature_paths.values()):
+            feature_tables = {
+                split: pd.read_csv(path)
+                for split, path in feature_paths.items()
+            }
+            print("Loaded cached feature tables from artifacts/features.")
+        else:
+            feature_tables = build_and_cache_features(
+                dataset_root=dataset_root,
+                feature_paths=feature_paths,
+                chunksize=args.chunksize,
+            )
+
+        print_feature_summary(feature_tables)
+        summary = run_training_experiments(
+            train_frame=feature_tables["train"],
+            validation_frame=feature_tables["validation"],
+            test_frame=feature_tables["test"],
+            baseline_output_dir=output_dir,
+            experiments_output_dir=output_dir / "experiments",
+        )
+        print_experiment_summary(summary)
+        return 0
+
     parser.error(f"Unsupported command: {command}")
     return 2
 
@@ -83,6 +109,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_shared_arguments(run_parser)
     run_parser.add_argument(
+        "--reuse-features",
+        action="store_true",
+        help="Reuse cached feature tables in artifacts/features when they already exist.",
+    )
+
+    experiments_parser = subparsers.add_parser(
+        "run-experiments",
+        help=(
+            "Run class-weighted, moderate-oversampling, and binary-risk experiments "
+            "without overwriting the main benchmark outputs."
+        ),
+    )
+    add_shared_arguments(experiments_parser)
+    experiments_parser.add_argument(
         "--reuse-features",
         action="store_true",
         help="Reuse cached feature tables in artifacts/features when they already exist.",
@@ -161,4 +201,25 @@ def format_metric_line(metric_block: dict[str, object]) -> str:
         f"weighted_f1={metric_block['weighted_f1']}, "
         f"mean_cost={metric_block['challenge_cost_mean']}, "
         f"total_cost={metric_block['challenge_cost_total']}"
+    )
+
+
+def print_experiment_summary(summary: dict[str, object]) -> None:
+    print("Experiment summary:")
+    print(f"- outputs: {summary['output_dir']}")
+    print(f"- markdown summary: {summary['summary_path']}")
+    best_cost = summary["best_multiclass_by_test_cost"]
+    best_recall = summary["best_multiclass_by_test_macro_recall"]
+    best_binary = summary["best_binary_by_test_positive_recall"]
+    print(
+        "- best multiclass by test mean cost: "
+        f"{best_cost.get('model')} ({best_cost.get('value')})"
+    )
+    print(
+        "- best multiclass by test macro recall: "
+        f"{best_recall.get('model')} ({best_recall.get('value')})"
+    )
+    print(
+        "- best binary by test positive recall: "
+        f"{best_binary.get('model')} ({best_binary.get('value')})"
     )

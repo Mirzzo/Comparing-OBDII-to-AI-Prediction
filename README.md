@@ -77,6 +77,17 @@ Reuse cached feature tables on later runs:
 python main.py run --reuse-features
 ```
 
+Run the separate training-improvement experiments without overwriting the main
+benchmark outputs:
+
+```bash
+python main.py run-experiments --reuse-features
+```
+
+This writes class-weighted multiclass, moderate-oversampling multiclass, and
+binary-risk experiment outputs under `artifacts/experiments/`, including
+comparison CSV files against the previously saved benchmark.
+
 Generate the standalone OBD-II comparison workbook without changing the AI
 training pipeline:
 
